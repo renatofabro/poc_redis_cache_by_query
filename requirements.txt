@@ -1,0 +1,10 @@
+# MySQL Redis Cache - Dependências
+
+# Driver MySQL
+mysql-connector-python==8.2.0
+
+# Cliente Redis
+redis==5.0.1
+
+# Opcional: Para melhor performance e recursos adicionais
+# hiredis==2.3.2  # Parser C de alta performance para Redis (descomente se necessário)
