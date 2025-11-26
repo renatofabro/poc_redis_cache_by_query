@@ -62,6 +62,7 @@ class MySQLRedisCache:
 
         # Prefixo para chaves do Redis
         self.cache_prefix = "mysql_cache:"
+        self.table_map_prefix = "table_map:"  # Prefixo para mapeamento tabela->hashes
 
     def _get_mysql_connection(self) -> mysql.connector.MySQLConnection:
         """
@@ -136,6 +137,163 @@ class MySQLRedisCache:
         """
         sanitized = self._sanitize_query(query)
         return sanitized.startswith('select')
+
+    def _get_query_type(self, query: str) -> str:
+        """
+        Identifica o tipo da query (SELECT, INSERT, UPDATE, DELETE, etc).
+
+        Args:
+            query: Query SQL
+
+        Returns:
+            Tipo da query em maiúsculas
+        """
+        sanitized = self._sanitize_query(query)
+        if sanitized.startswith('select'):
+            return 'SELECT'
+        elif sanitized.startswith('insert'):
+            return 'INSERT'
+        elif sanitized.startswith('update'):
+            return 'UPDATE'
+        elif sanitized.startswith('delete'):
+            return 'DELETE'
+        else:
+            return 'OTHER'
+
+    def _extract_tables_from_query(self, query: str) -> List[str]:
+        """
+        Extrai nomes de tabelas de uma query SQL.
+
+        Suporta: FROM, JOIN, INTO, UPDATE
+
+        Args:
+            query: Query SQL
+
+        Returns:
+            Lista de nomes de tabelas (sem duplicatas)
+        """
+        sanitized = self._sanitize_query(query)
+        tables = set()
+
+        # Padrões para encontrar tabelas
+        patterns = [
+            # FROM tabela
+            r'\bfrom\s+`?(\w+)`?',
+            # JOIN tabela
+            r'\bjoin\s+`?(\w+)`?',
+            # INTO tabela (INSERT)
+            r'\binto\s+`?(\w+)`?',
+            # UPDATE tabela
+            r'\bupdate\s+`?(\w+)`?',
+        ]
+
+        for pattern in patterns:
+            matches = re.finditer(pattern, sanitized)
+            for match in matches:
+                table_name = match.group(1)
+                # Ignora palavras-chave SQL comuns
+                if table_name not in ['select', 'where', 'values', 'set']:
+                    tables.add(table_name)
+
+        # Também captura aliases (ex: FROM usuarios u, usuarios AS u)
+        # Padrão: FROM tabela alias ou FROM tabela AS alias
+        alias_patterns = [
+            r'\bfrom\s+`?(\w+)`?\s+(?:as\s+)?\w+',
+            r'\bjoin\s+`?(\w+)`?\s+(?:as\s+)?\w+',
+        ]
+
+        for pattern in alias_patterns:
+            matches = re.finditer(pattern, sanitized)
+            for match in matches:
+                table_name = match.group(1)
+                if table_name not in ['select', 'where', 'values', 'set']:
+                    tables.add(table_name)
+
+        return list(tables)
+
+    def _get_table_map_key(self, table_name: str) -> str:
+        """
+        Gera chave do Redis para o mapeamento de tabela.
+
+        Args:
+            table_name: Nome da tabela
+
+        Returns:
+            Chave completa do Redis
+        """
+        return f"{self.table_map_prefix}{table_name}"
+
+    def _register_query_in_tables(
+        self,
+        query: str,
+        query_hash: str,
+        tables: List[str]
+    ) -> None:
+        """
+        Registra o hash da query em todas as tabelas envolvidas.
+
+        Cria um SET no Redis para cada tabela contendo os hashes
+        de todas as queries que usam essa tabela.
+
+        Args:
+            query: Query SQL original
+            query_hash: Hash da query
+            tables: Lista de tabelas envolvidas
+        """
+        redis_client = self._get_redis_client()
+        if not redis_client or not tables:
+            return
+
+        try:
+            for table in tables:
+                table_key = self._get_table_map_key(table)
+                # Adiciona o hash ao SET da tabela
+                redis_client.sadd(table_key, query_hash)
+                # Define TTL para o mapeamento (maior que o cache)
+                redis_client.expire(table_key, self.default_ttl * 2)
+        except RedisError as e:
+            print(f"[AVISO] Erro ao registrar query nas tabelas: {e}")
+
+    def _invalidate_tables_cache(self, tables: List[str]) -> int:
+        """
+        Invalida todos os caches relacionados às tabelas especificadas.
+
+        Args:
+            tables: Lista de nomes de tabelas
+
+        Returns:
+            Número total de caches invalidados
+        """
+        redis_client = self._get_redis_client()
+        if not redis_client or not tables:
+            return 0
+
+        total_deleted = 0
+
+        try:
+            for table in tables:
+                table_key = self._get_table_map_key(table)
+
+                # Obtém todos os hashes de queries que usam esta tabela
+                query_hashes = redis_client.smembers(table_key)
+
+                if query_hashes:
+                    # Invalida cada cache
+                    for query_hash_bytes in query_hashes:
+                        query_hash = query_hash_bytes.decode('utf-8') if isinstance(query_hash_bytes, bytes) else query_hash_bytes
+                        cache_key = self._get_cache_key(query_hash)
+                        deleted = redis_client.delete(cache_key)
+                        total_deleted += deleted
+
+                    # Remove o mapeamento da tabela
+                    redis_client.delete(table_key)
+
+                    print(f"[INFO] Invalidados {len(query_hashes)} cache(s) da tabela '{table}'")
+
+            return total_deleted
+        except RedisError as e:
+            print(f"[ERRO] Falha ao invalidar caches de tabelas: {e}")
+            return 0
 
     def _serialize_result(
         self,
@@ -227,6 +385,9 @@ class MySQLRedisCache:
         """
         Executa uma query com cache Redis (se for SELECT).
 
+        Para queries INSERT/UPDATE/DELETE, invalida automaticamente
+        os caches das tabelas afetadas.
+
         Args:
             query: Query SQL
             params: Parâmetros da query (opcional)
@@ -235,7 +396,32 @@ class MySQLRedisCache:
         Returns:
             MySQLCacheResult com os dados e metadados
         """
-        # Determina se deve usar cache
+        # Identifica tipo da query
+        query_type = self._get_query_type(query)
+
+        # Se for INSERT/UPDATE/DELETE, invalida caches das tabelas afetadas
+        if query_type in ['INSERT', 'UPDATE', 'DELETE']:
+            tables = self._extract_tables_from_query(query)
+            if tables:
+                invalidated = self._invalidate_tables_cache(tables)
+                if invalidated > 0:
+                    print(f"[INFO] Cache invalidado automaticamente: {invalidated} entrada(s) "
+                          f"das tabelas {tables}")
+
+            # Executa a query de modificação no MySQL
+            rows, columns = self._execute_mysql_query(query, params)
+            result_data = {
+                'query': query,
+                'from_cache': False,
+                'cache_hit': False,
+                'rows': rows,
+                'columns': columns,
+                'row_count': len(rows),
+                'cached_at': None
+            }
+            return MySQLCacheResult(result_data)
+
+        # Determina se deve usar cache (apenas para SELECT)
         should_cache = (
             (use_cache if use_cache is not None else self.cache_enabled)
             and self._is_select_query(query)
@@ -302,7 +488,10 @@ class MySQLRedisCache:
             'row_count': len(rows)
         })
 
-        # Armazena no cache
+        # Extrai tabelas da query para rastreamento
+        tables = self._extract_tables_from_query(query)
+
+        # Armazena no cache e registra nas tabelas
         if redis_client:
             try:
                 serialized = self._serialize_result(rows, columns, query)
@@ -311,6 +500,11 @@ class MySQLRedisCache:
                     self.default_ttl,
                     serialized
                 )
+
+                # Registra o hash desta query em todas as tabelas envolvidas
+                if tables:
+                    self._register_query_in_tables(query, query_hash, tables)
+
             except RedisError as e:
                 print(f"[AVISO] Erro ao armazenar no Redis: {e}")
 
@@ -342,13 +536,31 @@ class MySQLRedisCache:
                 # Invalida todos os caches com o prefixo
                 pattern = f"{self.cache_prefix}*"
                 keys = list(redis_client.scan_iter(match=pattern))
-                if keys:
-                    deleted = redis_client.delete(*keys)
+
+                # Também remove todos os mapeamentos de tabelas
+                table_pattern = f"{self.table_map_prefix}*"
+                table_keys = list(redis_client.scan_iter(match=table_pattern))
+
+                all_keys = keys + table_keys
+                if all_keys:
+                    deleted = redis_client.delete(*all_keys)
                     return deleted
                 return 0
         except RedisError as e:
             print(f"[ERRO] Falha ao invalidar cache: {e}")
             return 0
+
+    def invalidate_cache_by_table(self, table_name: str) -> int:
+        """
+        Invalida todos os caches relacionados a uma tabela específica.
+
+        Args:
+            table_name: Nome da tabela
+
+        Returns:
+            Número de caches invalidados
+        """
+        return self._invalidate_tables_cache([table_name])
 
     def set_ttl(self, query: str, ttl: int) -> bool:
         """
@@ -412,7 +624,7 @@ class MySQLRedisCache:
         Obtém estatísticas do cache.
 
         Returns:
-            Dicionário com estatísticas
+            Dicionário com estatísticas incluindo mapeamento de tabelas
         """
         redis_client = self._get_redis_client()
         if not redis_client:
@@ -422,15 +634,30 @@ class MySQLRedisCache:
             }
 
         try:
+            # Conta caches de queries
             pattern = f"{self.cache_prefix}*"
-            keys = list(redis_client.scan_iter(match=pattern))
+            cache_keys = list(redis_client.scan_iter(match=pattern))
+
+            # Conta mapeamentos de tabelas
+            table_pattern = f"{self.table_map_prefix}*"
+            table_keys = list(redis_client.scan_iter(match=table_pattern))
+
+            # Detalhes de tabelas rastreadas
+            table_details = {}
+            for table_key in table_keys:
+                table_name = table_key.decode('utf-8').replace(self.table_map_prefix, '')
+                query_count = redis_client.scard(table_key)
+                table_details[table_name] = query_count
 
             return {
                 'cache_enabled': self.cache_enabled,
                 'redis_available': True,
-                'total_cached_queries': len(keys),
+                'total_cached_queries': len(cache_keys),
+                'total_tracked_tables': len(table_keys),
+                'tracked_tables': table_details,
                 'default_ttl': self.default_ttl,
-                'cache_prefix': self.cache_prefix
+                'cache_prefix': self.cache_prefix,
+                'table_map_prefix': self.table_map_prefix
             }
         except RedisError as e:
             print(f"[ERRO] Falha ao obter estatísticas: {e}")
@@ -439,6 +666,31 @@ class MySQLRedisCache:
                 'redis_available': False,
                 'error': str(e)
             }
+
+    def get_table_queries(self, table_name: str) -> List[str]:
+        """
+        Retorna lista de hashes de queries que usam uma tabela específica.
+
+        Args:
+            table_name: Nome da tabela
+
+        Returns:
+            Lista de hashes de queries
+        """
+        redis_client = self._get_redis_client()
+        if not redis_client:
+            return []
+
+        try:
+            table_key = self._get_table_map_key(table_name)
+            query_hashes = redis_client.smembers(table_key)
+            return [
+                qh.decode('utf-8') if isinstance(qh, bytes) else qh
+                for qh in query_hashes
+            ]
+        except RedisError as e:
+            print(f"[ERRO] Falha ao obter queries da tabela: {e}")
+            return []
 
     def close(self) -> None:
         """Fecha conexões MySQL e Redis."""

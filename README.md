@@ -50,11 +50,14 @@ Este módulo intercepta queries SQL do tipo `SELECT`, cria um hash da query sani
 
 - ✅ **Cache automático** de queries `SELECT`
 - ✅ **Hash SHA256** de queries sanitizadas
+- ✅ **Rastreamento inteligente de tabelas** com mapeamento automático
+- ✅ **Invalidação automática** em INSERT/UPDATE/DELETE
+- ✅ **Suporte completo a JOINs** com múltiplas tabelas
 - ✅ **Compatibilidade total** com `mysql.connector` API
 - ✅ **Fallback automático** em caso de falha do Redis
 - ✅ **TTL configurável** por query ou global
-- ✅ **Invalidação de cache** individual ou em massa
-- ✅ **Métricas e estatísticas** de cache
+- ✅ **Invalidação de cache** individual, por tabela ou em massa
+- ✅ **Métricas e estatísticas** de cache e rastreamento
 - ✅ **Controle de habilitação** do cache em runtime
 - ✅ **Zero dependências extras** além de MySQL e Redis
 
@@ -136,6 +139,82 @@ start = time.time()
 result2 = cache.execute(query)
 print(f"Tempo: {time.time() - start:.4f}s")  # Ex: 0.0023s (50x mais rápido!)
 print(f"Do cache? {result2.from_cache}")     # True
+```
+
+## 🔄 Rastreamento de Tabelas e Invalidação Automática
+
+### Como Funciona
+
+O sistema mantém um **mapeamento automático** de quais queries usam cada tabela:
+
+```
+Redis:
+  table_map:usuarios → [hash1, hash2, hash3, ...]
+  table_map:pedidos  → [hash1, hash4, hash5, ...]
+```
+
+Quando você executa um **INSERT/UPDATE/DELETE**, o sistema:
+1. Identifica as tabelas afetadas
+2. Busca todos os hashes de queries que usam essas tabelas
+3. Invalida automaticamente todos esses caches
+
+### Benefícios para JOINs
+
+```python
+# Query com JOIN entre usuarios e pedidos
+query = """
+    SELECT u.nome, p.total
+    FROM usuarios u
+    JOIN pedidos p ON u.id = p.user_id
+"""
+
+# 1ª execução - cacheia e registra uso de 'usuarios' e 'pedidos'
+result = cache.execute(query)  # → MySQL
+
+# 2ª execução - retorna do cache
+result = cache.execute(query)  # → Redis (rápido!)
+
+# UPDATE em qualquer tabela relacionada
+cache.execute("UPDATE usuarios SET nome = 'João' WHERE id = 1")
+# ✓ Cache da query JOIN invalidado AUTOMATICAMENTE!
+
+# Próxima execução busca dados atualizados
+result = cache.execute(query)  # → MySQL (dados frescos)
+```
+
+### Exemplo Prático
+
+```python
+# Cachear queries com JOIN
+cache.execute("""
+    SELECT u.*, p.*
+    FROM usuarios u
+    LEFT JOIN pedidos p ON u.id = p.user_id
+    WHERE u.status = 'ativo'
+""")
+
+# Verificar rastreamento
+stats = cache.get_cache_stats()
+print(stats['tracked_tables'])
+# {'usuarios': 1, 'pedidos': 1}
+
+# UPDATE invalida automaticamente
+cache.execute("UPDATE pedidos SET status = 'pago' WHERE id = 123")
+# [INFO] Cache invalidado automaticamente: 1 entrada(s) das tabelas ['pedidos']
+
+# Próxima execução busca dados atualizados do MySQL
+```
+
+### Invalidação Manual por Tabela
+
+```python
+# Invalidar todos os caches que usam a tabela 'usuarios'
+deleted = cache.invalidate_cache_by_table('usuarios')
+print(f"Invalidados {deleted} cache(s)")
+
+# Ver queries que usam uma tabela
+hashes = cache.get_table_queries('usuarios')
+print(f"Tabela 'usuarios' é usada por {len(hashes)} query(ies)")
 ```
 
 ## 🛠️ Funcionalidades
@@ -315,12 +394,27 @@ Executa uma query com cache.
 
 #### `invalidate_cache(query=None) → int`
 
-Invalida cache.
+Invalida cache de queries e mapeamentos de tabelas.
 
 **Parâmetros:**
 - `query` (str, opcional): Query específica ou None para tudo
 
 **Retorna:** Número de chaves removidas
+
+#### `invalidate_cache_by_table(table_name) → int`
+
+Invalida todos os caches relacionados a uma tabela específica.
+
+**Parâmetros:**
+- `table_name` (str): Nome da tabela
+
+**Retorna:** Número de caches invalidados
+
+**Exemplo:**
+```python
+# Invalidar todos os caches que usam a tabela 'usuarios'
+deleted = cache.invalidate_cache_by_table('usuarios')
+```
 
 #### `set_ttl(query, ttl) → bool`
 
@@ -348,7 +442,40 @@ Desabilita o cache.
 
 #### `get_cache_stats() → dict`
 
-Retorna estatísticas do cache.
+Retorna estatísticas do cache incluindo rastreamento de tabelas.
+
+**Retorna:** Dicionário com:
+- `cache_enabled`: Se cache está habilitado
+- `redis_available`: Se Redis está disponível
+- `total_cached_queries`: Total de queries cacheadas
+- `total_tracked_tables`: Total de tabelas rastreadas
+- `tracked_tables`: Dict com {tabela: num_queries}
+- `default_ttl`: TTL padrão
+- `cache_prefix`: Prefixo das chaves de cache
+- `table_map_prefix`: Prefixo do mapeamento de tabelas
+
+**Exemplo:**
+```python
+stats = cache.get_cache_stats()
+print(f"Queries cacheadas: {stats['total_cached_queries']}")
+print(f"Tabelas rastreadas: {stats['tracked_tables']}")
+# {'usuarios': 3, 'pedidos': 2}
+```
+
+#### `get_table_queries(table_name) → List[str]`
+
+Retorna lista de hashes de queries que usam uma tabela específica.
+
+**Parâmetros:**
+- `table_name` (str): Nome da tabela
+
+**Retorna:** Lista de hashes de queries
+
+**Exemplo:**
+```python
+hashes = cache.get_table_queries('usuarios')
+print(f"Tabela 'usuarios' usada por {len(hashes)} query(ies)")
+```
 
 #### `close() → None`
 
@@ -408,22 +535,54 @@ except Exception as e:
     print(f"Erro geral: {e}")
 ```
 
-### Exemplo 3: Invalidação Após UPDATE
+### Exemplo 3: Invalidação Automática com JOINs
 
 ```python
-def atualizar_usuario(user_id, dados):
-    # Atualizar no banco
-    cache.execute(
-        f"UPDATE usuarios SET nome = '{dados['nome']}' WHERE id = {user_id}",
-        use_cache=False
-    )
+# Cachear query com JOIN
+query_join = """
+    SELECT u.nome, u.email, p.total, p.data
+    FROM usuarios u
+    INNER JOIN pedidos p ON u.id = p.user_id
+    WHERE u.status = 'ativo'
+"""
 
-    # Invalidar caches relacionados
-    cache.invalidate_cache("SELECT * FROM usuarios")
-    cache.invalidate_cache(f"SELECT * FROM usuarios WHERE id = {user_id}")
+result1 = cache.execute(query_join)
+print(f"Cache hit? {result1.from_cache}")  # False (primeira vez)
+
+result2 = cache.execute(query_join)
+print(f"Cache hit? {result2.from_cache}")  # True (segunda vez)
+
+# UPDATE em qualquer tabela do JOIN invalida AUTOMATICAMENTE
+cache.execute("UPDATE usuarios SET nome = 'João' WHERE id = 1")
+# [INFO] Cache invalidado automaticamente: 1 entrada(s) das tabelas ['usuarios']
+
+result3 = cache.execute(query_join)
+print(f"Cache hit? {result3.from_cache}")  # False (dados atualizados!)
+
+# Também funciona com INSERT e DELETE
+cache.execute("INSERT INTO pedidos (user_id, total) VALUES (1, 99.90)")
+# [INFO] Cache invalidado automaticamente: 1 entrada(s) das tabelas ['pedidos']
 ```
 
-### Exemplo 4: Configuração com Variáveis de Ambiente
+### Exemplo 4: Gerenciamento de Cache por Tabela
+
+```python
+# Verificar quais queries usam uma tabela
+hashes = cache.get_table_queries('usuarios')
+print(f"Tabela 'usuarios' é usada por {len(hashes)} query(ies)")
+
+# Invalidar apenas caches de uma tabela específica
+deleted = cache.invalidate_cache_by_table('pedidos')
+print(f"Invalidados {deleted} cache(s) da tabela 'pedidos'")
+
+# Ver estatísticas detalhadas
+stats = cache.get_cache_stats()
+print(f"Tabelas rastreadas:")
+for table, count in stats['tracked_tables'].items():
+    print(f"  - {table}: {count} query(ies)")
+```
+
+### Exemplo 5: Configuração com Variáveis de Ambiente
 
 ```python
 import os
@@ -506,11 +665,15 @@ print(stats)
 
 ## 📝 Notas Importantes
 
-1. **Queries parametrizadas não são cacheadas** por padrão (segurança)
-2. **FLUSH ALL remove TUDO do Redis**, não apenas caches deste módulo
-3. **Fallback automático**: Em caso de falha do Redis, sempre usa MySQL
-4. **Thread-safety**: Não é thread-safe, use uma instância por thread
-5. **Transações**: Cache não participa de transações MySQL
+1. **Rastreamento automático de tabelas**: Toda query SELECT registra automaticamente as tabelas usadas
+2. **Invalidação automática**: INSERT/UPDATE/DELETE invalidam TODOS os caches das tabelas afetadas
+3. **JOINs suportados**: Queries com múltiplas tabelas são rastreadas corretamente
+4. **Queries parametrizadas não são cacheadas** por padrão (segurança)
+5. **FLUSH ALL remove TUDO do Redis**, não apenas caches deste módulo
+6. **Fallback automático**: Em caso de falha do Redis, sempre usa MySQL
+7. **Thread-safety**: Não é thread-safe, use uma instância por thread
+8. **Transações**: Cache não participa de transações MySQL
+9. **Extração de tabelas**: Usa regex para identificar tabelas em FROM, JOIN, INTO, UPDATE
 
 ## 🤝 Contribuindo
 
@@ -535,9 +698,13 @@ Para problemas e dúvidas:
 
 ## 🔮 Roadmap
 
+- [x] ~~Rastreamento de tabelas e invalidação automática~~
+- [x] ~~Suporte completo a JOINs com múltiplas tabelas~~
 - [ ] Suporte a queries parametrizadas cacheadas
 - [ ] Compressão de resultados grandes
-- [ ] Métricas detalhadas (hit rate, latência)
-- [ ] Suporte a múltiplos backends de cache
-- [ ] Invalidação automática por padrões
+- [ ] Métricas detalhadas (hit rate, latência, cache miss rate)
+- [ ] Suporte a múltiplos backends de cache (Memcached, etc)
+- [ ] Parser SQL mais robusto (usando sqlparse)
 - [ ] Interface CLI para gestão de cache
+- [ ] Warm-up automático de cache
+- [ ] Cache de prepared statements
