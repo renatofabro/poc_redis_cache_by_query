@@ -606,6 +606,106 @@ redis_config = {
 cache = MySQLRedisCache(mysql_config, redis_config)
 ```
 
+## 🧪 Testes
+
+O projeto inclui testes unitários e de integração completos.
+
+### Instalando Dependências de Teste
+
+```bash
+pip install -r requirements.txt
+```
+
+### Testes Unitários (com Mocks)
+
+Testes rápidos que não requerem MySQL ou Redis rodando:
+
+```bash
+# Executar todos os testes
+pytest test_mysql_redis_cache.py -v
+
+# Com cobertura de código
+pytest test_mysql_redis_cache.py --cov=mysql_redis_cache --cov-report=html
+
+# Executar testes específicos
+pytest test_mysql_redis_cache.py::TestMySQLRedisCache::test_extract_tables_with_join -v
+```
+
+**Testes unitários incluem:**
+- ✅ Sanitização e hash de queries
+- ✅ Extração de tabelas (FROM, JOIN, INSERT, UPDATE)
+- ✅ Cache básico (hit/miss)
+- ✅ Rastreamento de tabelas
+- ✅ Invalidação automática
+- ✅ Métodos de MySQLCacheResult
+- ✅ Fallback em caso de erro
+- ✅ Estatísticas
+
+### Teste de Integração Ponta a Ponta
+
+Teste completo com MySQL e Redis **REAIS**:
+
+```bash
+python test_integration.py
+```
+
+**Requisitos:**
+- MySQL rodando em `localhost:3306`
+- Redis rodando em `localhost:6379`
+- Usuário com permissões para criar/dropar database
+- Ajuste credenciais no arquivo se necessário
+
+**O teste de integração executa:**
+1. ✅ Setup automático (cria database e tabelas)
+2. ✅ Cache básico de SELECT
+3. ✅ Rastreamento de tabelas
+4. ✅ Queries com JOIN
+5. ✅ Invalidação automática (INSERT/UPDATE/DELETE)
+6. ✅ Invalidação de JOINs
+7. ✅ Invalidação manual por tabela
+8. ✅ Métodos de resultado (fetchone, fetchall, as_dict)
+9. ✅ Comparação de performance
+10. ✅ Teardown automático (limpa tudo)
+
+**Saída esperada:**
+```
+╔══════════════════════════════════════════════════════════════════╗
+║               TESTE DE INTEGRAÇÃO PONTA A PONTA                  ║
+╚══════════════════════════════════════════════════════════════════╝
+
+======================================================================
+SETUP: Criando banco de dados e tabelas
+======================================================================
+  ✓ Database test_mysql_redis_cache removido (se existia)
+  ✓ Database test_mysql_redis_cache criado
+  ✓ Tabela 'usuarios' criada
+  ✓ Tabela 'pedidos' criada
+  ✓ 5 usuários inseridos
+  ✓ 5 pedidos inseridos
+  ✓ Setup completo!
+
+...
+
+======================================================================
+RESUMO DOS TESTES
+======================================================================
+Total de testes: 10
+Passaram: 10 ✓
+Falharam: 0 ✗
+
+🎉 TODOS OS TESTES PASSARAM COM SUCESSO! 🎉
+```
+
+### Executar Todos os Testes
+
+```bash
+# Testes unitários + cobertura
+pytest test_mysql_redis_cache.py -v --cov=mysql_redis_cache
+
+# Teste de integração (requer MySQL e Redis)
+python test_integration.py
+```
+
 ## 🐛 Troubleshooting
 
 ### Redis não conecta
