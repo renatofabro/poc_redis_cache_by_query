@@ -225,6 +225,7 @@ class TestMySQLRedisCache:
         mock_redis = MagicMock()
         mock_redis.ping.return_value = True
         mock_redis.smembers.return_value = [b'hash1', b'hash2']
+        mock_redis.delete.return_value = 1  # Mock delete to return integer
         mock_redis_class.return_value = mock_redis
 
         # Mock MySQL
@@ -251,6 +252,7 @@ class TestMySQLRedisCache:
         mock_redis = MagicMock()
         mock_redis.ping.return_value = True
         mock_redis.smembers.return_value = [b'hash1']
+        mock_redis.delete.return_value = 1  # Mock delete to return integer
         mock_redis_class.return_value = mock_redis
 
         # Mock MySQL

@@ -90,7 +90,7 @@ class MySQLRedisCache:
                 self._redis_client = redis.Redis(**self.redis_config)
                 # Testa conexão
                 self._redis_client.ping()
-            except RedisError as e:
+            except (RedisError, Exception) as e:
                 print(f"[AVISO] Falha ao conectar ao Redis: {e}")
                 print("[AVISO] Continuando sem cache...")
                 return None
